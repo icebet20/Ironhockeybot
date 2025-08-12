@@ -1,168 +1,337 @@
 import os
+import json
+import time
 import logging
-import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from dateutil import parser as dtparser
+
+import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Bot, Update, InputFile
+from apscheduler.triggers.cron import CronTrigger
+
+from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ---------- env ----------
+# ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL = os.getenv("CHANNEL_USERNAME")            # e.g. @kfkfkjfjfc
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))         # your numeric Telegram ID (via @userinfobot)
-TIMEZONE_OFFSET = int(os.getenv("TZ_OFFSET", "3")) # Moscow = +3
-WELCOME_ON_START = os.getenv("WELCOME_ON_START", "true").lower() == "true"
+CHANNEL = os.getenv("CHANNEL_USERNAME")  # e.g. @kfkfkjfjfc
 
-# ---------- logging ----------
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+LEAGUES = os.getenv("LEAGUES", "any")          # "any" => все хоккейные лиги из TheOddsAPI
+MARKETS = os.getenv("MARKETS", "h2h,totals")   # "h2h,totals"
+ODDS_RANGE = os.getenv("ODDS_RANGE", "1.70-2.50")
+POST_TIMES = os.getenv("POST_TIMES", "11:00,18:30")  # МСК слоты, через запятую
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3"))   # Москва = +3
+
+# ----------------- CONST -----------------
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+SPORTS_CACHE_FILE = "sports_cache.json"
+STATE_FILE = "posted_events.json"  # хранит id уже опубликованных событий для пост-итога
+
+HEADERS = {"User-Agent": "IronHockeyBot/1.0"}
+
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("iron-hockey")
+log = logging.getLogger("iron-hockey-auto")
 
-# ---------- helpers ----------
-async def send_photo(bot: Bot, photo_path_or_url: str, caption: str = ""):
-    if photo_path_or_url.startswith("http"):
-        await bot.send_photo(CHANNEL, photo=photo_path_or_url, caption=caption, parse_mode=ParseMode.MARKDOWN)
-    else:
-        with open(photo_path_or_url, "rb") as f:
-            await bot.send_photo(CHANNEL, photo=InputFile(f), caption=caption, parse_mode=ParseMode.MARKDOWN)
+# ----------------- UTILS -----------------
+def now_utc():
+    return datetime.now(timezone.utc)
 
-async def send_text(bot: Bot, text: str):
-    await bot.send_message(CHANNEL, text, parse_mode=ParseMode.MARKDOWN)
+def to_msk(dt: datetime) -> datetime:
+    return dt + timedelta(hours=TZ_OFFSET)
 
-# ---------- commands for ADMIN only ----------
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if uid != ADMIN_ID:
-            return
-        return await func(update, context)
-    return wrapper
+def fmt_dt(dt: datetime) -> str:
+    return to_msk(dt).strftime("%d.%m %H:%M")
 
-@admin_only
-async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /post <text> — постит текст
-    /postphoto <url> | <подпись> — постит фото (url или файл в ответе на сообщение с изображением)
-    """
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("Формат: /post ТЕКСТ")
-        return
-    await send_text(context.bot, text)
-    await update.message.reply_text("✅ Отправлено в канал")
-
-@admin_only
-async def postphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    argline = " ".join(context.args)
-    if "|" in argline:
-        url, caption = [a.strip() for a in argline.split("|", 1)]
-    else:
-        url, caption = argline.strip(), ""
-    # если фото прислано файлом в реплае
-    if not url and update.message.reply_to_message and update.message.reply_to_message.photo:
-        file_id = update.message.reply_to_message.photo[-1].file_id
-        await context.bot.send_photo(CHANNEL, photo=file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await send_photo(context.bot, url, caption)
-    await update.message.reply_text("✅ Фото отправлено в канал")
-
-@admin_only
-async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /schedule HH:MM | ТЕКСТ — запланировать текст
-    /schedulephoto HH:MM | URL | ПОДПИСЬ — запланировать фото
-    Время по МСК (TZ_OFFSET).
-    """
-    line = " ".join(context.args)
-    if "|" not in line:
-        await update.message.reply_text("Формат: /schedule 18:00 | ТЕКСТ")
-        return
-    time_str, payload = [p.strip() for p in line.split("|", 1)]
+def load_json(path, default):
     try:
-        now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-        hh, mm = map(int, time_str.split(":"))
-        run_local = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if run_local <= now:
-            run_local += timedelta(days=1)
-        run_utc = run_local - timedelta(hours=TIMEZONE_OFFSET)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        await update.message.reply_text("Некорректное время. Пример: 18:30")
-        return
+        return default
 
-    job_id = f"txt-{run_utc.isoformat()}"
-    context.job_queue.run_once(
-        lambda c: c.bot.send_message(CHANNEL, payload, parse_mode=ParseMode.MARKDOWN),
-        when=(run_utc - datetime.utcnow()).total_seconds(),
-        name=job_id,
-        chat_id=update.effective_chat.id
+def save_json(path, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Failed to save %s: %s", path, e)
+
+def parse_range(text: str):
+    lo, hi = text.split("-")
+    return float(lo.strip()), float(hi.strip())
+
+ODDS_MIN, ODDS_MAX = parse_range(ODDS_RANGE)
+
+# ----------------- ODDS API -----------------
+def fetch_sports():
+    """Получить список видов спорта и закешировать"""
+    url = f"{ODDS_BASE}/sports/?apiKey={ODDS_API_KEY}"
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    sports = r.json()
+    save_json(SPORTS_CACHE_FILE, sports)
+    return sports
+
+def hockey_sports():
+    sports = load_json(SPORTS_CACHE_FILE, [])
+    if not sports:
+        try:
+            sports = fetch_sports()
+        except Exception as e:
+            log.warning("fetch_sports failed: %s", e)
+            return []
+    # фильтруем хоккей
+    hk = [s for s in sports if "icehockey" in (s.get("key","")) or "hockey" in (s.get("title","").lower())]
+    return hk
+
+def fetch_odds_for_sport(sport_key: str):
+    url = f"{ODDS_BASE}/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "eu,us,uk",
+        "markets": MARKETS,
+        "oddsFormat": "decimal",
+        "dateFormat": "iso"
+    }
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    return r.json()
+
+def fetch_scores_for_sport(sport_key: str, days_from=2):
+    url = f"{ODDS_BASE}/sports/{sport_key}/scores"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "daysFrom": str(days_from),
+        "dateFormat": "iso"
+    }
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    return r.json()
+
+# ----------------- PICK LOGIC -----------------
+def pick_best_bet(events):
+    best = None
+    for ev in events:
+        try:
+            commence = dtparser.isoparse(ev["commence_time"])
+        except Exception:
+            continue
+        if commence < now_utc() or commence > now_utc() + timedelta(hours=36):
+            continue
+
+        home = ev.get("home_team","")
+        away = ev.get("away_team","")
+        bookmakers = ev.get("bookmakers", [])
+        for bm in bookmakers:
+            for mk in bm.get("markets", []):
+                key = mk.get("key")
+                outcomes = mk.get("outcomes", [])
+                if key == "h2h":
+                    for o in outcomes:
+                        try:
+                            price = float(o.get("price", 0))
+                        except Exception:
+                            continue
+                        if ODDS_MIN <= price <= ODDS_MAX and o.get("name"):
+                            cand = {
+                                "sport": ev.get("sport_key"),
+                                "id": ev.get("id"),
+                                "commence_time": ev.get("commence_time"),
+                                "home": home, "away": away,
+                                "market": "h2h",
+                                "selection": o["name"],
+                                "line": None,
+                                "price": price,
+                                "bookmaker": bm.get("title", bm.get("key"))
+                            }
+                            if (best is None) or (cand["price"] > best["price"]):
+                                best = cand
+                elif key == "totals":
+                    for o in outcomes:
+                        try:
+                            price = float(o.get("price", 0))
+                        except Exception:
+                            continue
+                        point = o.get("point")
+                        name = o.get("name","").lower()
+                        if point is None or not name:
+                            continue
+                        if ODDS_MIN <= price <= ODDS_MAX and name in ("over","under"):
+                            cand = {
+                                "sport": ev.get("sport_key"),
+                                "id": ev.get("id"),
+                                "commence_time": ev.get("commence_time"),
+                                "home": home, "away": away,
+                                "market": "totals",
+                                "selection": name,
+                                "line": float(point),
+                                "price": price,
+                                "bookmaker": bm.get("title", bm.get("key"))
+                            }
+                            if (best is None) or (cand["price"] > best["price"]):
+                                best = cand
+    return best
+
+def compose_pick_text(pick):
+    dt = dtparser.isoparse(pick["commence_time"])
+    dt_str = fmt_dt(dt)
+    h, a = pick["home"], pick["away"]
+    if pick["market"] == "h2h":
+        sel = pick["selection"]
+        if sel == h:
+            sel_text = f"Победа {h}"
+        elif sel == a:
+            sel_text = f"Победа {a}"
+        else:
+            sel_text = f"Исход: {sel}"
+    else:
+        sel = pick["selection"]
+        sign = "Больше" if sel == "over" else "Меньше"
+        sel_text = f"Тотал: {sign} ({pick['line']})"
+
+    return (
+        f"🏒 *ЖЕЛЕЗНЫЙ ХОККЕЙ*\n"
+        f"{h} — {a}\n"
+        f"🕒 {dt_str} (МСК)\n\n"
+        f"**Прогноз:** {sel_text}\n"
+        f"**Коэффициент:** {pick['price']:.2f}\n"
+        f"Букмекер: {pick['bookmaker']}\n\n"
+        f"📌 Учитываем форму, свежесть составов и динамику тоталов за последние игры.\n"
+        f"⚠️ Ставки на спорт — это риск. Контент носит информационный характер.\n"
     )
-    await update.message.reply_text(f"🗓 Запланировано {time_str} МСК")
 
-@admin_only
-async def schedulephoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    line = " ".join(context.args)
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 2:
-        await update.message.reply_text("Формат: /schedulephoto 18:00 | URL | ПОДПИСЬ")
+# ----------------- STATE -----------------
+def get_state():
+    return load_json(STATE_FILE, {"posted": []})
+
+def remember_posted(event_key):
+    st = get_state()
+    if event_key not in st["posted"]:
+        st["posted"].append(event_key)
+        save_json(STATE_FILE, st)
+
+def was_posted(event_key):
+    st = get_state()
+    return event_key in st["posted"]
+
+# ----------------- MAIN -----------------
+async def autopost_once(bot: Bot):
+    if not ODDS_API_KEY:
+        log.error("ODDS_API_KEY is missing")
         return
-    time_str, url = parts[0], parts[1]
-    caption = parts[2] if len(parts) > 2 else ""
-
-    try:
-        now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-        hh, mm = map(int, time_str.split(":"))
-        run_local = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if run_local <= now:
-            run_local += timedelta(days=1)
-        run_utc = run_local - timedelta(hours=TIMEZONE_OFFSET)
-    except Exception:
-        await update.message.reply_text("Некорректное время. Пример: 18:30")
+    sports = hockey_sports()
+    if not sports:
+        log.warning("No hockey sports available from TheOddsAPI")
         return
 
-    async def _job(ctx: ContextTypes.DEFAULT_TYPE):
-        await send_photo(ctx.bot, url, caption)
+    picked = None
+    for s in sports:
+        key = s.get("key")
+        try:
+            odds = fetch_odds_for_sport(key)
+        except Exception as e:
+            log.warning("odds fetch failed for %s: %s", key, e)
+            continue
+        for ev in odds:
+            ev["sport_key"] = key
+        cand = pick_best_bet(odds)
+        if cand and ((picked is None) or (cand["price"] > picked["price"])):
+            picked = cand
 
-    # через APScheduler (надежнее для Railway)
-    scheduler: AsyncIOScheduler = update.application.job_queue.scheduler  # type: ignore
-    scheduler.add_job(lambda: asyncio.create_task(_job(context)),
-                      "date", run_date=run_utc)
+    if not picked:
+        log.info("No suitable pick in range; skipping this slot.")
+        return
 
-    await update.message.reply_text(f"🗓 Фото запланировано {time_str} МСК")
+    ev_key = f"{picked['sport']}::{picked['id']}::{picked['market']}"
+    if was_posted(ev_key):
+        log.info("Already posted for %s, skipping", ev_key)
+        return
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("Бот готов. Команды: /post, /postphoto, /schedule, /schedulephoto")
-    else:
-        await update.message.reply_text("Привет!")
+    text = compose_pick_text(picked)
+    await bot.send_message(CHANNEL, text, parse_mode=ParseMode.MARKDOWN)
+    remember_posted(ev_key)
+    log.info("Posted: %s", ev_key)
+
+async def post_results(bot: Bot):
+    st = get_state()
+    if not st["posted"]:
+        return
+    sports_set = set([p.split("::")[0] for p in st["posted"]])
+    for sport_key in sports_set:
+        try:
+            scores = fetch_scores_for_sport(sport_key, days_from=2)
+        except Exception as e:
+            log.warning("scores fetch failed for %s: %s", sport_key, e)
+            continue
+        for sc in scores:
+            ev_id = sc.get("id")
+            if not ev_id:
+                continue
+            for market in ("h2h","totals"):
+                ev_key = f"{sport_key}::{ev_id}::{market}"
+                if not was_posted(ev_key):
+                    continue
+                if sc.get("completed"):
+                    home = sc.get("home_team","")
+                    away = sc.get("away_team","")
+                    scores_map = sc.get("scores") or []
+                    sh = sa = None
+                    for t in scores_map:
+                        if t.get("name") == home:
+                            sh = t.get("score")
+                        elif t.get("name") == away:
+                            sa = t.get("score")
+                    if sh is not None and sa is not None:
+                        text = (
+                            "✅ *ИТОГ МАТЧА*\n"
+                            f"{home} — {away}\n"
+                            f"Счёт: {sh}:{sa}\n\n"
+                            "**Если ставка зашла** — двигаемся дальше и закрепляем плюс.\n"
+                            "**Если не зашла** — сохраняем холодную голову: на дистанции мы в плюсе.\n"
+                            "Следующий прогноз — в ближайшее время."
+                        )
+                        try:
+                            await bot.send_message(CHANNEL, text, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            log.warning("result post failed: %s", e)
+
+def setup_scheduler(bot: Bot):
+    sched = AsyncIOScheduler(timezone=timezone.utc)
+    times = [t.strip() for t in POST_TIMES.split(",") if t.strip()]
+    for t in times:
+        try:
+            hh, mm = t.split(":")
+            h_utc = (int(hh) - TZ_OFFSET) % 24
+            m_utc = int(mm)
+            sched.add_job(lambda: bot.loop.create_task(autopost_once(bot)),
+                          CronTrigger(hour=h_utc, minute=m_utc))
+            log.info("Scheduled autopost at %s MSK -> %02d:%02d UTC", t, h_utc, m_utc)
+        except Exception as e:
+            log.warning("Bad time '%s': %s", t, e)
+
+    sched.add_job(lambda: bot.loop.create_task(post_results(bot)),
+                  CronTrigger(minute="*/30"))
+    sched.start()
+    return sched
 
 async def main():
     if not BOT_TOKEN or not CHANNEL:
-        raise SystemExit("BOT_TOKEN и CHANNEL_USERNAME обязательны")
-    app = Application.builder().token(BOT_TOKEN).build()
+        raise SystemExit("BOT_TOKEN и CHANNEL_USERNAME are required")
+    if not ODDS_API_KEY:
+        logging.warning("ODDS_API_KEY is missing; autopost will be skipped")
 
-    # Встроенный планировщик (для schedulephoto)
-    scheduler = AsyncIOScheduler()
-    scheduler.start()
+    bot = Bot(BOT_TOKEN)
+    setup_scheduler(bot)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("post", post_cmd))
-    app.add_handler(CommandHandler("postphoto", postphoto_cmd))
-    app.add_handler(CommandHandler("schedule", schedule_cmd))
-    app.add_handler(CommandHandler("schedulephoto", schedulephoto_cmd))
-    # игнор остальных сообщений
-    app.add_handler(MessageHandler(filters.ALL, lambda u, c: None))
-
-    if WELCOME_ON_START and ADMIN_ID:
-        try:
-            await app.bot.send_message(ADMIN_ID, "✅ Бот запущен. /post /schedule готовы.")
-        except Exception as e:
-            log.warning(f"notify admin failed: {e}")
-
-    await app.initialize()
-    await app.start()
-    log.info("IRON HOCKEY bot running…")
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app.updater.wait()
+    logging.info("Iron Hockey autonomous bot is running…")
+    while True:
+        time.sleep(10)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
